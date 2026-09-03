@@ -54,6 +54,8 @@ pub enum DiscoverySource {
     Continue,
     /// `OpenAI` Codex CLI config
     Codex,
+    /// `OpenCode` global config (`~/.config/opencode/opencode.json`)
+    OpenCode,
     /// Generic MCP config in ~/.config/mcp/
     McpConfig,
     /// Running process
@@ -191,6 +193,7 @@ impl AutoDiscovery {
             DiscoverySource::Zed => self.config_scanner.scan_zed().await,
             DiscoverySource::Continue => self.config_scanner.scan_continue().await,
             DiscoverySource::Codex => self.config_scanner.scan_codex().await,
+            DiscoverySource::OpenCode => self.config_scanner.scan_opencode().await,
             DiscoverySource::McpConfig => self.config_scanner.scan_mcp_config_dir().await,
             DiscoverySource::RunningProcess => self.process_scanner.scan().await,
             DiscoverySource::Environment => self.config_scanner.scan_environment(),

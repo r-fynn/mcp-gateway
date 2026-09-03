@@ -24,7 +24,11 @@
 //! | Windsurf       | `mcpServers`      | `~/.codeium/windsurf/mcp_config.json`  |
 //! | Cline          | `mcpServers`      | `.cline/mcp_servers.json` (ws-rel)     |
 //! | Zed            | `context_servers` | `~/.config/zed/settings.json`          |
+//! | `OpenCode`     | `mcp`             | `.opencode/opencode.jsonc` (workspace-rel, comment-preserving) |
 //! | Generic        | `mcpServers`      | stdout or `--output`                   |
+//!
+//! `OpenCode`'s entry shape and merge strategy differ from every other
+//! client — see `build_opencode_entry` and `merge_into_opencode_config`.
 
 mod watch;
 
@@ -117,6 +121,48 @@ pub fn build_gateway_entry(
             json!({
                 "command": "mcp-gateway",
                 "args": args
+            })
+        }
+    }
+}
+
+/// Build the JSON entry to insert for this gateway instance, in `OpenCode`'s
+/// own schema.
+///
+/// `OpenCode`'s `mcp.<name>` entries are shaped differently from every other
+/// client this exporter targets: a `type` discriminator, and `command` as a
+/// single array combining the binary and its arguments (not a separate
+/// `command` string + `args` array).
+///
+/// Proxy mode produces `{"type": "remote", "url": "...", "enabled": true}`.
+/// Stdio mode produces `{"type": "local", "command": [...], "enabled": true}`.
+pub fn build_opencode_entry(
+    config: &Config,
+    config_path: Option<&Path>,
+    mode: ConnectionMode,
+) -> Value {
+    match resolve_mode(mode, config) {
+        ConnectionMode::Proxy | ConnectionMode::Auto => {
+            json!({
+                "type": "remote",
+                "url": format!("http://{}:{}/mcp", config.server.host, config.server.port),
+                "enabled": true
+            })
+        }
+        ConnectionMode::Stdio => {
+            let mut command = vec![
+                "mcp-gateway".to_string(),
+                "serve".to_string(),
+                "--stdio".to_string(),
+            ];
+            if let Some(p) = config_path {
+                command.push("-c".to_string());
+                command.push(p.display().to_string());
+            }
+            json!({
+                "type": "local",
+                "command": command,
+                "enabled": true
             })
         }
     }
@@ -221,7 +267,18 @@ pub fn merge_into_config(
         ExportAction::Created
     };
 
-    // Ensure parent directory exists before writing.
+    let json_str = serde_json::to_string_pretty(&doc)
+        .map_err(|e| format!("JSON serialization failed: {e}"))?;
+
+    atomic_write(path, &json_str)?;
+
+    Ok(action)
+}
+
+/// Write `content` to `path` atomically: write to a sibling tempfile in the
+/// same directory, then rename over the target. Ensures the parent directory
+/// exists first.
+fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -229,22 +286,18 @@ pub fn merge_into_config(
             .map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
     }
 
-    let json_str = serde_json::to_string_pretty(&doc)
-        .map_err(|e| format!("JSON serialization failed: {e}"))?;
-
-    // Atomic write: write to a sibling tempfile, then rename.
     let parent = path.parent().unwrap_or(Path::new("."));
     let file_name = path.file_name().map_or_else(
         || "config.json".to_string(),
         |n| n.to_string_lossy().into_owned(),
     );
     let tmp = parent.join(format!(".{file_name}.tmp"));
-    std::fs::write(&tmp, &json_str)
+    std::fs::write(&tmp, content)
         .map_err(|e| format!("Cannot write temp file {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path)
         .map_err(|e| format!("Cannot rename {} -> {}: {e}", tmp.display(), path.display()))?;
 
-    Ok(action)
+    Ok(())
 }
 
 fn merge_into_config_with_safety(
@@ -320,6 +373,117 @@ fn verify_gateway_entry(
             "Verification failed: '{}.{}' in {} does not match planned entry",
             servers_key,
             entry_name,
+            path.display()
+        ))
+    }
+}
+
+// ── OpenCode-specific merge (comment-preserving) ────────────────────────────────
+
+/// Merge (upsert) a gateway entry into `OpenCode`'s `.opencode/opencode.jsonc`.
+///
+/// Unlike `merge_into_config`, which reserializes the whole document through
+/// `serde_json::Value` (destroying any comments), this uses `jsonc-parser`'s
+/// CST editor: it mutates only the `mcp.<entry_name>` node in place and
+/// renders the rest of the document — including comments elsewhere in the
+/// file — byte-for-byte unchanged. Comments *inside* the existing
+/// `mcp.<entry_name>` entry, if any, are not preserved, since that node is
+/// replaced wholesale.
+fn merge_into_opencode_config(
+    path: &Path,
+    entry_name: &str,
+    entry: &Value,
+) -> Result<ExportAction, String> {
+    let existed = path.exists();
+    let content = if existed {
+        std::fs::read_to_string(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?
+    } else {
+        String::new()
+    };
+
+    let root =
+        jsonc_parser::cst::CstRootNode::parse(&content, &jsonc_parser::ParseOptions::default())
+            .map_err(|e| format!("Cannot parse {}: {e}", path.display()))?;
+    let root_obj = root
+        .object_value_or_create()
+        .ok_or_else(|| format!("Config root of {} is not a JSON object", path.display()))?;
+    let mcp_obj = root_obj
+        .object_value_or_create("mcp")
+        .ok_or_else(|| format!("'mcp' in {} is not a JSON object", path.display()))?;
+
+    let input_value = to_cst_input(entry);
+    if let Some(prop) = mcp_obj.get(entry_name) {
+        prop.set_value(input_value);
+    } else {
+        mcp_obj.append(entry_name, input_value);
+    }
+
+    atomic_write(path, &root.to_string())?;
+
+    Ok(if existed {
+        ExportAction::Updated
+    } else {
+        ExportAction::Created
+    })
+}
+
+/// Convert a `serde_json::Value` into `jsonc-parser`'s CST input-value type.
+fn to_cst_input(value: &Value) -> jsonc_parser::cst::CstInputValue {
+    use jsonc_parser::cst::CstInputValue;
+    match value {
+        Value::Null => CstInputValue::Null,
+        Value::Bool(b) => CstInputValue::Bool(*b),
+        Value::Number(n) => CstInputValue::Number(n.to_string()),
+        Value::String(s) => CstInputValue::String(s.clone()),
+        Value::Array(arr) => CstInputValue::Array(arr.iter().map(to_cst_input).collect()),
+        Value::Object(map) => CstInputValue::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), to_cst_input(v)))
+                .collect(),
+        ),
+    }
+}
+
+fn merge_into_opencode_config_with_safety(
+    path: &Path,
+    entry_name: &str,
+    entry: &Value,
+) -> Result<SafeMergeResult, String> {
+    let backup_path = create_backup(path)?;
+    let action = merge_into_opencode_config(path, entry_name, entry)?;
+    verify_opencode_entry(path, entry_name, entry)?;
+
+    Ok(SafeMergeResult {
+        action,
+        backup_path,
+        verified: true,
+    })
+}
+
+fn verify_opencode_entry(path: &Path, entry_name: &str, entry: &Value) -> Result<(), String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Cannot verify {}: {e}", path.display()))?;
+    let root =
+        jsonc_parser::cst::CstRootNode::parse(&content, &jsonc_parser::ParseOptions::default())
+            .map_err(|e| format!("Cannot parse {} after write: {e}", path.display()))?;
+    let actual = root
+        .object_value()
+        .and_then(|obj| obj.object_value("mcp"))
+        .and_then(|mcp| mcp.get(entry_name))
+        .and_then(|prop| prop.value())
+        .and_then(|node| node.to_serde_value())
+        .ok_or_else(|| {
+            format!(
+                "Verification failed: 'mcp.{entry_name}' missing from {}",
+                path.display()
+            )
+        })?;
+
+    if &actual == entry {
+        Ok(())
+    } else {
+        Err(format!(
+            "Verification failed: 'mcp.{entry_name}' in {} does not match planned entry",
             path.display()
         ))
     }
@@ -424,6 +588,11 @@ pub(super) fn client_specs(target: ExportTarget) -> Vec<ClientSpec> {
             path: zed_settings_path(),
             servers_key: "context_servers",
         },
+        ClientSpec {
+            label: "OpenCode",
+            path: cwd.join(".opencode/opencode.jsonc"),
+            servers_key: "mcp",
+        },
     ];
 
     match target {
@@ -453,6 +622,10 @@ pub(super) fn client_specs(target: ExportTarget) -> Vec<ClientSpec> {
             .filter(|s| s.label == "Cline")
             .collect(),
         ExportTarget::Zed => all_specs.into_iter().filter(|s| s.label == "Zed").collect(),
+        ExportTarget::OpenCode => all_specs
+            .into_iter()
+            .filter(|s| s.label == "OpenCode")
+            .collect(),
         ExportTarget::Generic => vec![], // handled separately in run_config_export
     }
 }
@@ -522,16 +695,25 @@ pub async fn run_config_export(
         return ExitCode::SUCCESS;
     }
 
+    // OpenCode's entry shape differs from every other client (see
+    // `build_opencode_entry`) — show the shape that will actually be
+    // written when it's the only target selected.
+    let display_entry = if target == ExportTarget::OpenCode {
+        build_opencode_entry(&config, Some(config_path), resolved)
+    } else {
+        entry
+    };
+
     println!("Exporting gateway config to AI clients...");
     println!();
     println!("Planned gateway entry ({mode_label} mode):");
     println!(
         "{}",
-        serde_json::to_string_pretty(&json!({ name: entry.clone() })).unwrap_or_default()
+        serde_json::to_string_pretty(&json!({ name: display_entry })).unwrap_or_default()
     );
     println!();
 
-    let results = do_export(target, name, dry_run, &entry);
+    let results = do_export(target, name, dry_run, &config, Some(config_path), resolved);
 
     let mut written = 0usize;
     let mut failed = false;
@@ -581,13 +763,30 @@ pub async fn run_config_export(
 }
 
 /// Perform the actual export for all specs; returns a result per client.
-fn do_export(target: ExportTarget, name: &str, dry_run: bool, entry: &Value) -> Vec<ExportResult> {
+///
+/// Builds the gateway entry per spec rather than once up front: `OpenCode`
+/// needs its own entry shape (see `build_opencode_entry`), so the same
+/// pre-built `Value` can't be reused for every client the way it can for
+/// everyone else.
+fn do_export(
+    target: ExportTarget,
+    name: &str,
+    dry_run: bool,
+    config: &Config,
+    config_path: Option<&Path>,
+    mode: ConnectionMode,
+) -> Vec<ExportResult> {
     let specs = client_specs(target);
 
     specs
         .into_iter()
         .map(|spec| {
-            let (action, safety) = export_one_detailed(&spec, name, entry, dry_run);
+            let entry = if spec.label == "OpenCode" {
+                build_opencode_entry(config, config_path, mode)
+            } else {
+                build_gateway_entry(config, config_path, mode)
+            };
+            let (action, safety) = export_one_detailed(&spec, name, &entry, dry_run);
             ExportResult {
                 client: spec.label,
                 path: spec.path,
@@ -676,7 +875,15 @@ fn export_one_detailed(
         };
         (action, None)
     } else {
-        match merge_into_config_with_safety(&spec.path, spec.servers_key, name, entry) {
+        // OpenCode's `.opencode/opencode.jsonc` may contain comments, which
+        // the generic parse-mutate-reserialize merge would destroy — it gets
+        // its own comment-preserving writer instead.
+        let result = if spec.label == "OpenCode" {
+            merge_into_opencode_config_with_safety(&spec.path, name, entry)
+        } else {
+            merge_into_config_with_safety(&spec.path, spec.servers_key, name, entry)
+        };
+        match result {
             Ok(result) => {
                 let safety = ExportSafety {
                     backup_path: result.backup_path,

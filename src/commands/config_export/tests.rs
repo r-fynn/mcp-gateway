@@ -9,9 +9,20 @@ use serde_json::{Value, json};
 use mcp_gateway::{cli::ConnectionMode, config::Config};
 
 use super::{
-    ClientSpec, ExportAction, ExportTarget, build_gateway_entry, client_specs, export_one,
-    merge_into_config, merge_into_config_with_safety, resolve_mode, rollback_client_config,
+    ClientSpec, ExportAction, ExportTarget, build_gateway_entry, build_opencode_entry,
+    client_specs, export_one, merge_into_config, merge_into_config_with_safety,
+    merge_into_opencode_config, merge_into_opencode_config_with_safety, resolve_mode,
+    rollback_client_config,
 };
+
+/// Parse JSONC content (which `serde_json` alone can't, if it has comments)
+/// into a plain `serde_json::Value` for assertions.
+fn parse_jsonc(content: &str) -> Value {
+    jsonc_parser::cst::CstRootNode::parse(content, &jsonc_parser::ParseOptions::default())
+        .unwrap()
+        .to_serde_value()
+        .unwrap()
+}
 
 fn default_config() -> Config {
     Config::default()
@@ -172,7 +183,7 @@ fn client_specs_resolve_paths() {
             spec.label
         );
         assert!(
-            ["mcpServers", "servers", "context_servers"].contains(&spec.servers_key),
+            ["mcpServers", "servers", "context_servers", "mcp"].contains(&spec.servers_key),
             "unexpected servers_key '{}' for {}",
             spec.servers_key,
             spec.label
@@ -342,4 +353,218 @@ fn rollback_restores_backup_to_original_config_path() {
     // THEN: the original client config content is restored
     assert_eq!(restored, path);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+// ── OpenCode: build_opencode_entry ──────────────────────────────────────────────
+
+#[test]
+fn build_opencode_entry_proxy_mode() {
+    // GIVEN: default config and Proxy mode
+    let cfg = default_config();
+    let entry = build_opencode_entry(&cfg, None, ConnectionMode::Proxy);
+
+    // THEN: produces OpenCode's "remote" shape, not the generic {"url": ...}
+    assert_eq!(entry["type"], "remote");
+    assert_eq!(entry["url"], "http://127.0.0.1:39400/mcp");
+    assert_eq!(entry["enabled"], true);
+    assert!(entry.get("command").is_none());
+}
+
+#[test]
+fn build_opencode_entry_stdio_mode() {
+    // GIVEN: default config and Stdio mode, no config path
+    let cfg = default_config();
+    let entry = build_opencode_entry(&cfg, None, ConnectionMode::Stdio);
+
+    // THEN: produces OpenCode's "local" shape — command is a single array,
+    // not a separate command string + args array
+    assert_eq!(entry["type"], "local");
+    assert_eq!(entry["enabled"], true);
+    let command = entry["command"].as_array().unwrap();
+    assert_eq!(command, &["mcp-gateway", "serve", "--stdio"]);
+}
+
+#[test]
+fn build_opencode_entry_stdio_with_config() {
+    // GIVEN: Stdio mode with a config path supplied
+    let cfg = default_config();
+    let config_path = Path::new("/etc/mcp-gateway/gateway.yaml");
+    let entry = build_opencode_entry(&cfg, Some(config_path), ConnectionMode::Stdio);
+
+    // THEN: -c and the path are appended into the same command array
+    let command = entry["command"].as_array().unwrap();
+    assert_eq!(
+        command,
+        &[
+            "mcp-gateway",
+            "serve",
+            "--stdio",
+            "-c",
+            "/etc/mcp-gateway/gateway.yaml"
+        ]
+    );
+}
+
+// ── OpenCode: client_specs & gating ─────────────────────────────────────────────
+
+#[test]
+fn client_specs_opencode_resolves_project_relative_jsonc() {
+    // GIVEN: OpenCode target
+    let specs = client_specs(ExportTarget::OpenCode);
+
+    // THEN: exactly one spec, pointing at .opencode/opencode.jsonc under `mcp`
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].label, "OpenCode");
+    assert_eq!(specs[0].servers_key, "mcp");
+    assert!(specs[0].path.ends_with(".opencode/opencode.jsonc"));
+}
+
+#[test]
+fn opencode_export_skips_when_marker_dir_absent() {
+    // GIVEN: a workspace with no .opencode/ directory
+    let dir = tempfile::tempdir().unwrap();
+    let spec = ClientSpec {
+        label: "OpenCode",
+        path: dir.path().join(".opencode/opencode.jsonc"),
+        servers_key: "mcp",
+    };
+    let entry = json!({"type": "remote", "url": "http://127.0.0.1:39400/mcp", "enabled": true});
+
+    // WHEN: exporting (not dry-run)
+    let action = export_one(&spec, "gateway", &entry, false);
+
+    // THEN: skipped, and nothing was written
+    assert!(matches!(action, ExportAction::Skipped(_)));
+    assert!(!spec.path.exists());
+}
+
+#[test]
+fn opencode_export_writes_when_marker_dir_present() {
+    // GIVEN: a workspace with an existing .opencode/ directory (OpenCode used before)
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".opencode")).unwrap();
+    let spec = ClientSpec {
+        label: "OpenCode",
+        path: dir.path().join(".opencode/opencode.jsonc"),
+        servers_key: "mcp",
+    };
+    let entry = json!({"type": "remote", "url": "http://127.0.0.1:39400/mcp", "enabled": true});
+
+    // WHEN: exporting (not dry-run), routed through export_one_detailed's
+    // OpenCode branch (the comment-preserving writer)
+    let action = export_one(&spec, "gateway", &entry, false);
+
+    // THEN: file is created with the entry under "mcp"
+    assert!(matches!(action, ExportAction::Created));
+    let content = std::fs::read_to_string(&spec.path).unwrap();
+    let parsed = parse_jsonc(&content);
+    assert_eq!(
+        parsed["mcp"]["gateway"]["url"],
+        "http://127.0.0.1:39400/mcp"
+    );
+}
+
+// ── OpenCode: merge_into_opencode_config ────────────────────────────────────────
+
+#[test]
+fn merge_into_opencode_new_file() {
+    // GIVEN: a path that does not exist yet
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("opencode.jsonc");
+    let entry = json!({"type": "remote", "url": "http://127.0.0.1:39400/mcp", "enabled": true});
+
+    // WHEN: merging into a non-existent file
+    let action = merge_into_opencode_config(&path, "gateway", &entry).unwrap();
+
+    // THEN: file is created under the "mcp" key
+    assert!(matches!(action, ExportAction::Created));
+    let content = std::fs::read_to_string(&path).unwrap();
+    let parsed = parse_jsonc(&content);
+    assert_eq!(parsed["mcp"]["gateway"]["type"], "remote");
+    assert_eq!(
+        parsed["mcp"]["gateway"]["url"],
+        "http://127.0.0.1:39400/mcp"
+    );
+}
+
+#[test]
+fn merge_into_opencode_updates_existing_entry() {
+    // GIVEN: an existing opencode.jsonc with a stale gateway entry
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("opencode.jsonc");
+    std::fs::write(
+        &path,
+        r#"{"mcp": {"gateway": {"type": "remote", "url": "http://old:1234/mcp", "enabled": true}}}"#,
+    )
+    .unwrap();
+
+    let new_entry = json!({"type": "remote", "url": "http://127.0.0.1:39400/mcp", "enabled": true});
+
+    // WHEN: merging with the same entry name
+    let action = merge_into_opencode_config(&path, "gateway", &new_entry).unwrap();
+
+    // THEN: entry is replaced, action is Updated
+    assert!(matches!(action, ExportAction::Updated));
+    let content = std::fs::read_to_string(&path).unwrap();
+    let parsed = parse_jsonc(&content);
+    assert_eq!(
+        parsed["mcp"]["gateway"]["url"],
+        "http://127.0.0.1:39400/mcp"
+    );
+}
+
+#[test]
+fn merge_into_opencode_preserves_comments_outside_mcp() {
+    // GIVEN: an opencode.jsonc with comments and unrelated keys, no "mcp" yet
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("opencode.jsonc");
+    let original = "{\n  // top-level schema pin\n  \"$schema\": \"https://opencode.ai/config.json\",\n  // agents live here\n  \"agent\": {}\n}\n";
+    std::fs::write(&path, original).unwrap();
+
+    let entry =
+        json!({"type": "local", "command": ["mcp-gateway", "serve", "--stdio"], "enabled": true});
+
+    // WHEN: merging in a fresh "mcp" entry
+    let action = merge_into_opencode_config(&path, "gateway", &entry).unwrap();
+
+    // THEN: action is Updated (file already existed), the comments and the
+    // unrelated "$schema"/"agent" keys survive byte-for-byte, and the new
+    // "mcp" entry is present and correct
+    assert!(matches!(action, ExportAction::Updated));
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert!(content.contains("// top-level schema pin"));
+    assert!(content.contains("// agents live here"));
+    assert!(content.contains("\"$schema\": \"https://opencode.ai/config.json\""));
+
+    let parsed = parse_jsonc(&content);
+    assert_eq!(parsed["mcp"]["gateway"]["command"][0], "mcp-gateway");
+}
+
+#[test]
+fn opencode_safe_merge_creates_backup_and_verifies() {
+    // GIVEN: an existing opencode.jsonc with a stale gateway entry
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("opencode.jsonc");
+    let original =
+        r#"{"mcp":{"gateway":{"type":"remote","url":"http://old:1234/mcp","enabled":true}}}"#;
+    std::fs::write(&path, original).unwrap();
+
+    let entry = json!({"type": "remote", "url": "http://127.0.0.1:39400/mcp", "enabled": true});
+
+    // WHEN: applying the safe merge path used by setup export
+    let result = merge_into_opencode_config_with_safety(&path, "gateway", &entry).unwrap();
+
+    // THEN: it updates, keeps a byte-for-byte backup, and verifies the write
+    assert!(matches!(result.action, ExportAction::Updated));
+    assert!(result.verified);
+    let backup_path = result
+        .backup_path
+        .expect("existing config must be backed up");
+    assert_eq!(std::fs::read_to_string(&backup_path).unwrap(), original);
+
+    let parsed = parse_jsonc(&std::fs::read_to_string(&path).unwrap());
+    assert_eq!(
+        parsed["mcp"]["gateway"]["url"],
+        "http://127.0.0.1:39400/mcp"
+    );
 }

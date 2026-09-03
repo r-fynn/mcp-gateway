@@ -120,7 +120,7 @@ Invoke-WebRequest -Uri https://github.com/MikkoParkkola/mcp-gateway/releases/lat
 mcp-gateway setup wizard --configure-client
 ```
 
-Scans Claude Desktop, Claude Code, Cursor, Zed, Continue.dev, Codex, and running MCP processes; lets you pick which servers to import into `gateway.yaml`; previews the gateway entry; writes it into each detected client config; verifies the write; and prints backup and rollback paths when an existing client config changes. Add `--yes` to skip the prompts and import everything.
+Scans Claude Desktop, Claude Code, Cursor, Zed, Continue.dev, Codex, OpenCode, and running MCP processes; lets you pick which servers to import into `gateway.yaml`; previews the gateway entry; writes it into each detected client config; verifies the write; and prints backup and rollback paths when an existing client config changes. Add `--yes` to skip the prompts and import everything.
 
 #### Option B: add servers from the built-in registry
 
@@ -196,6 +196,7 @@ Existing client files are backed up before mutation. The command prints the exac
 | `windsurf` | `~/.codeium/windsurf/mcp_config.json` |
 | `cline` | `.cline/mcp_servers.json` (workspace) |
 | `zed` | `~/.config/zed/settings.json` |
+| `opencode` | `.opencode/opencode.jsonc` (workspace, comment-preserving) |
 
 Modes: `--mode proxy` (HTTP), `--mode stdio` (subprocess), `--mode auto` (probe the health endpoint, then fall back).
 

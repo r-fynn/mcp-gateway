@@ -83,6 +83,9 @@ pub enum ExportTarget {
     Cline,
     /// Zed (`~/.config/zed/settings.json`)
     Zed,
+    /// `OpenCode` (`.opencode/opencode.jsonc`, project-relative, comment-preserving)
+    #[value(name = "opencode")]
+    OpenCode,
     /// Generic: write to stdout
     Generic,
     /// All supported clients
@@ -537,7 +540,8 @@ pub enum SetupCommand {
     /// Export gateway.yaml as client-native MCP config files
     ///
     /// Generates JSON config entries for AI clients (Claude Code, Cursor, VS Code
-    /// Copilot, Windsurf, Cline, Zed, Claude Desktop) from the single gateway.yaml.
+    /// Copilot, Windsurf, Cline, Zed, Claude Desktop, `OpenCode`) from the single
+    /// gateway.yaml.
     /// Supports HTTP proxy and stdio subprocess modes with auto-detection.
     ///
     /// # Examples

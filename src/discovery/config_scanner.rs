@@ -71,6 +71,11 @@ impl ConfigScanner {
             servers.append(&mut s);
         }
 
+        // Scan OpenCode global config
+        if let Ok(mut s) = self.scan_opencode().await {
+            servers.append(&mut s);
+        }
+
         // Scan generic MCP config directory
         if let Ok(mut s) = self.scan_mcp_config_dir().await {
             servers.append(&mut s);
@@ -466,6 +471,23 @@ impl ConfigScanner {
             .await
     }
 
+    /// Scan `OpenCode` global configuration (`~/.config/opencode/opencode.json`).
+    ///
+    /// Format: `{ "mcp": { "<name>": { "type": "local", "command": [...], ... } } }`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file exists but cannot be read or parsed.
+    pub async fn scan_opencode(&self) -> Result<Vec<DiscoveredServer>> {
+        let config_path = Self::opencode_config_path()?;
+        if !config_path.exists() {
+            debug!("OpenCode config not found at {}", config_path.display());
+            return Ok(Vec::new());
+        }
+        debug!("Scanning OpenCode config at {}", config_path.display());
+        self.parse_opencode_config(&config_path).await
+    }
+
     // ── Zed-specific parser ────────────────────────────────────────────────
 
     /// Parse Zed `settings.json` — `context_servers` key.
@@ -579,6 +601,62 @@ impl ConfigScanner {
         Ok(servers)
     }
 
+    // ── OpenCode-specific parser ─────────────────────────────────────────────
+
+    /// Parse `OpenCode` `opencode.json` — `mcp` key.
+    ///
+    /// Unlike every other client scanned here, `OpenCode`'s `command` is a
+    /// single array combining the binary and its arguments (e.g.
+    /// `["npx", "-y", "some-server"]`), not a separate `command` string +
+    /// `args` array. Normalize it before delegating to the shared
+    /// `parse_server_config`. Remote (`url`-based) entries already match
+    /// `parse_server_config`'s expected shape and pass through unchanged.
+    async fn parse_opencode_config(&self, path: &Path) -> Result<Vec<DiscoveredServer>> {
+        let content = tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| Error::Config(format!("Failed to read OpenCode config: {e}")))?;
+
+        let config: Value = serde_json::from_str(&content)
+            .map_err(|e| Error::Config(format!("Failed to parse OpenCode config JSON: {e}")))?;
+
+        let mut servers = Vec::new();
+
+        if let Some(mcp) = config.get("mcp").and_then(|v| v.as_object()) {
+            for (name, server_config) in mcp {
+                let normalized = Self::normalize_opencode_entry(server_config);
+                if let Some(server) =
+                    Self::parse_server_config(name, &normalized, &DiscoverySource::OpenCode, path)
+                {
+                    servers.push(server);
+                }
+            }
+        }
+
+        Ok(servers)
+    }
+
+    /// Rewrite an `OpenCode` `mcp.<name>` entry's array-form `command` into the
+    /// `{"command": "<binary>", "args": [...]}` shape `parse_server_config`
+    /// expects. Entries without an array `command` (e.g. `type: "remote"`
+    /// entries, which use `url` instead) pass through unchanged.
+    fn normalize_opencode_entry(entry: &Value) -> Value {
+        let Some(command_arr) = entry.get("command").and_then(|v| v.as_array()) else {
+            return entry.clone();
+        };
+        let mut parts = command_arr.iter().filter_map(|v| v.as_str());
+        let Some(binary) = parts.next() else {
+            return entry.clone();
+        };
+        let args: Vec<Value> = parts.map(|s| Value::String(s.to_string())).collect();
+
+        let mut normalized = entry.clone();
+        if let Some(obj) = normalized.as_object_mut() {
+            obj.insert("command".to_string(), Value::String(binary.to_string()));
+            obj.insert("args".to_string(), Value::Array(args));
+        }
+        normalized
+    }
+
     // ── New path helpers ───────────────────────────────────────────────────
 
     /// Get Claude Code CLI config path (`~/.claude.json`).
@@ -621,6 +699,13 @@ impl ConfigScanner {
         let home = dirs::home_dir()
             .ok_or_else(|| Error::Config("Could not determine home directory".to_string()))?;
         Ok(home.join(".codex/config.json"))
+    }
+
+    /// Get `OpenCode` global config path (`~/.config/opencode/opencode.json`).
+    fn opencode_config_path() -> Result<PathBuf> {
+        let home = dirs::home_dir()
+            .ok_or_else(|| Error::Config("Could not determine home directory".to_string()))?;
+        Ok(home.join(".config/opencode/opencode.json"))
     }
 
     /// Extract port number from URL
@@ -708,5 +793,95 @@ impl ConfigScanner {
 impl Default for ConfigScanner {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn parse_opencode_config_local_and_remote_entries() {
+        // GIVEN: an opencode.json with a local (array-command) entry and a
+        // remote (url) entry
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "mcp": {
+                    "local-server": {
+                        "type": "local",
+                        "command": ["npx", "-y", "some-server", "--flag"],
+                        "enabled": true
+                    },
+                    "remote-server": {
+                        "type": "remote",
+                        "url": "https://mcp.example.com/mcp"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let scanner = ConfigScanner::new();
+
+        // WHEN: parsing the config
+        let servers = scanner.parse_opencode_config(&path).await.unwrap();
+
+        // THEN: both entries are discovered with the correct transport
+        assert_eq!(servers.len(), 2);
+
+        let local = servers.iter().find(|s| s.name == "local-server").unwrap();
+        assert_eq!(local.source, DiscoverySource::OpenCode);
+        match &local.transport {
+            TransportConfig::Stdio { command, .. } => {
+                assert_eq!(command, "npx -y some-server --flag");
+            }
+            other => panic!("expected Stdio transport, got {other:?}"),
+        }
+
+        let remote = servers.iter().find(|s| s.name == "remote-server").unwrap();
+        match &remote.transport {
+            TransportConfig::Http { http_url, .. } => {
+                assert_eq!(http_url, "https://mcp.example.com/mcp");
+            }
+            other => panic!("expected Http transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalize_opencode_entry_splits_array_command() {
+        // GIVEN: a local entry with an array command
+        let entry = serde_json::json!({
+            "type": "local",
+            "command": ["mcp-gateway", "serve", "--stdio"],
+            "enabled": true
+        });
+
+        // WHEN: normalizing
+        let normalized = ConfigScanner::normalize_opencode_entry(&entry);
+
+        // THEN: command becomes a string, args holds the rest
+        assert_eq!(normalized["command"], "mcp-gateway");
+        assert_eq!(normalized["args"], serde_json::json!(["serve", "--stdio"]));
+    }
+
+    #[test]
+    fn normalize_opencode_entry_passes_through_remote() {
+        // GIVEN: a remote (url-based) entry with no array command
+        let entry = serde_json::json!({"type": "remote", "url": "https://example.com/mcp"});
+
+        // WHEN: normalizing
+        let normalized = ConfigScanner::normalize_opencode_entry(&entry);
+
+        // THEN: entry is unchanged
+        assert_eq!(normalized, entry);
+    }
+
+    #[test]
+    fn opencode_config_path_ends_with_expected_filename() {
+        let p = ConfigScanner::opencode_config_path().unwrap();
+        assert!(p.ends_with(".config/opencode/opencode.json"));
     }
 }

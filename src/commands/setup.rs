@@ -195,6 +195,7 @@ fn source_label(source: &DiscoverySource) -> String {
         DiscoverySource::Zed => "Zed".to_string(),
         DiscoverySource::Continue => "Continue.dev".to_string(),
         DiscoverySource::Codex => "OpenAI Codex CLI".to_string(),
+        DiscoverySource::OpenCode => "OpenCode".to_string(),
         DiscoverySource::McpConfig => "~/.config/mcp".to_string(),
         DiscoverySource::RunningProcess => "running process".to_string(),
         DiscoverySource::Environment => "environment".to_string(),

@@ -146,6 +146,10 @@ walkdir = "2.5"
 # Glob pattern matching for firewall rules (RFC-0071)
 glob = "0.3"
 
+# JSONC parsing with byte-span AST (config-export: comment-preserving merge
+# into opencode's .opencode/opencode.jsonc, which may contain comments).
+jsonc-parser = { version = "0.33", features = ["serde_json", "cst"], optional = true }
+
 # Metrics
 telemetry_metrics = { package = "metrics", version = "0.24" }
 metrics-exporter-prometheus = { version = "0.18", optional = true }
@@ -164,7 +168,7 @@ default = ["a2a", "webui", "config-export", "cost-governance", "firewall", "disc
 ## No new dependencies: reqwest, serde, serde_json, tokio already present.
 a2a = []
 webui = []
-config-export = []
+config-export = ["dep:jsonc-parser"]
 cost-governance = []
 firewall = []
 discovery = []
